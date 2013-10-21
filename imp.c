@@ -15,6 +15,7 @@ typedef enum {
   FIXNUM,
   POINTER,
   FN,
+  NIL,
 } imp_object_type;
 
 typedef struct imp_object_struct *imp_object;
@@ -35,6 +36,7 @@ typedef struct imp_object_struct {
     struct {
       void *jit_fn;
       int nargs;
+      imp_object closure[];
     } fn;
   } fields;
 } imp_object_struct;
@@ -94,14 +96,15 @@ int64_t imp_cint(imp_object x) {
 }
 
 imp_object_type imp_type_of(imp_object object) {
-  if (imp_is_fixnum(object)) {
+  if (object == NULL) {
+    return NIL;
+  } else if (imp_is_fixnum(object)) {
     return FIXNUM;
   }
   return object->type;
 }
 
 imp_object imp_cons(imp_object head, imp_object tail) {
-  assert(head);
   imp_object cell = malloc(sizeof(imp_object_struct));
   cell->type = CONS;
   cell->fields.cons.head = head;
@@ -154,6 +157,7 @@ int imp_equals(imp_object x, imp_object y) {
   case CHARACTER: return x->fields.character == y->fields.character;
   case SYMBOL: return !strcmp(x->fields.symbol.name, y->fields.symbol.name);
   case CONS: return imp_equals(imp_first(x), imp_first(y)) && imp_equals(imp_rest(x), imp_rest(y));
+  case NIL:
   case FN: return x == y;
   }
 }
@@ -193,11 +197,10 @@ static imp_object read_token() {
 }
 
 void print_obj(imp_object object) {
-  if (object == NULL) {
+  switch (imp_type_of(object)) {
+  case NIL:
     printf("nil");
     return;
-  }
-  switch (imp_type_of(object)) {
   case CHARACTER:
     printf("\\%c", object->fields.character);
     break;
@@ -229,20 +232,29 @@ void print_obj(imp_object object) {
 imp_object sread();
 
 imp_object sread_tail() {
-  imp_object form = sread();
-  if (form != NULL) {
-    return imp_cons(form, sread_tail());
-  } else {
+  imp_object form = read_token();
+  if (form == &END_OF_INPUT) {
+    fprintf(stderr, "unexpected EOF\n");
+    exit(1);
+  } else if (form == &RPAREN) {
     return NULL;
+  } else if (form == &LPAREN) {
+    return imp_cons(sread_tail(), sread_tail());
+  } else {
+    return imp_cons(form, sread_tail());
   }
 }
 
 imp_object sread() {
   imp_object token = read_token();
-  if (token == &LPAREN) {
-    return imp_cons(sread(), sread_tail());
+  if (token == &END_OF_INPUT) {
+    fprintf(stderr, "unexpected EOF\n");
+    exit(1);
+  } else if (token == &LPAREN) {
+    return sread_tail();
   } else if (token == &RPAREN) {
-    return NULL;
+    fprintf(stderr, "unexpected )\n");
+    exit(1);
   } else {
     return token;
   }
@@ -272,26 +284,35 @@ static jit_type_t fn_signature(int nparams) {
   return jit_type_create_signature(jit_abi_cdecl, jit_type_void_ptr, params, nparams, 1);
 }
 
-jit_value_t compile(imp_object env, jit_function_t function, imp_object form) {
+jit_value_t emit_malloc(jit_function_t function, int size) {
+  jit_type_t *params = malloc(sizeof(jit_type_t));
+  params[0] = jit_type_ulong;
+  jit_type_t signature = jit_type_create_signature(jit_abi_cdecl, jit_type_void_ptr, params, 1, 1);
+  jit_value_t *args = malloc(sizeof(jit_value_t));
+  args[0] = jit_value_create_nint_constant(function, jit_type_nint, size);
+  return jit_insn_call_native (function, "malloc", (void *)malloc, signature, args, 1, 0);
+}
+
+jit_value_t compile(imp_object *captures, imp_object env, jit_function_t function, imp_object form) {
   if (imp_type_of(form) == CONS) {
     imp_object f = imp_first(form);
     if (imp_type_of(f) == SYMBOL) {
       char *fname = f->fields.symbol.name;
       if (!strcmp(fname, "+")) {
-        jit_value_t x = compile(env, function, imp_second(form));
-        jit_value_t y = compile(env, function, imp_third(form));
+        jit_value_t x = compile(captures, env, function, imp_second(form));
+        jit_value_t y = compile(captures, env, function, imp_third(form));
         jit_value_t tmp = jit_insn_add(function, x, y);
         jit_value_t one = jit_value_create_nint_constant(function, jit_type_nint, 1);
         return jit_insn_sub(function, tmp, one);
       } else if (!strcmp(fname, "-")) {
-        jit_value_t x = compile(env, function, imp_second(form));
-        jit_value_t y = compile(env, function, imp_third(form));
+        jit_value_t x = compile(captures, env, function, imp_second(form));
+        jit_value_t y = compile(captures, env, function, imp_third(form));
         jit_value_t tmp = jit_insn_sub(function, x, y);
         jit_value_t one = jit_value_create_nint_constant(function, jit_type_nint, 1);
         return jit_insn_add(function, tmp, one);
       } else if (!strcmp(fname, "*")) {
-        jit_value_t x = compile(env, function, imp_second(form));
-        jit_value_t y = compile(env, function, imp_third(form));
+        jit_value_t x = compile(captures, env, function, imp_second(form));
+        jit_value_t y = compile(captures, env, function, imp_third(form));
         jit_value_t one = jit_value_create_nint_constant(function, jit_type_nint, 1);
         jit_value_t x1 = jit_insn_shr(function, x, one);
         jit_value_t y1 = jit_insn_shr(function, y, one);
@@ -299,8 +320,8 @@ jit_value_t compile(imp_object env, jit_function_t function, imp_object form) {
         jit_value_t tmp = jit_insn_shl(function, tmp1, one);
         return jit_insn_add(function, tmp, one);
       } else if (!strcmp(fname, "/")) {
-        jit_value_t x = compile(env, function, imp_second(form));
-        jit_value_t y = compile(env, function, imp_third(form));
+        jit_value_t x = compile(captures, env, function, imp_second(form));
+        jit_value_t y = compile(captures, env, function, imp_third(form));
         jit_value_t one = jit_value_create_nint_constant(function, jit_type_nint, 1);
         jit_value_t x1 = jit_insn_shr(function, x, one);
         jit_value_t y1 = jit_insn_shr(function, y, one);
@@ -312,52 +333,109 @@ jit_value_t compile(imp_object env, jit_function_t function, imp_object form) {
         imp_object body = imp_third(form);
         imp_object bindname = imp_first(bindings);
         imp_object bindvalue = imp_second(bindings);
-        jit_value_t jitvalue = compile(env, function, bindvalue);
+        jit_value_t jitvalue = compile(captures, env, function, bindvalue);
         env = imp_assoc(env, bindname, imp_pointer(jitvalue));
-        return compile(env, function, body);
+        return compile(captures, env, function, body);
       } else if (!strcmp(fname, "fn")) { // (fn (x y z) ...)
         imp_object params = imp_second(form);
         imp_object body = imp_third(form);
-        int nparams = imp_count(params);
+        int nparams = imp_count(params) + 1; // +1 for closure param
         jit_type_t signature = fn_signature(nparams);
         jit_function_t fn = jit_function_create(jit_function_get_context(function), signature);
 
-        imp_object newenv = NULL;
-        for (imp_object it = params, i = 0; it != NULL; it = imp_rest(it)) {
+        // add end of frame marker to environment
+        imp_object newenv = imp_cons(NULL, env);
+        int i = 1;
+        for (imp_object it = params; it != NULL; it = imp_rest(it)) {
+          printf("param @%d\n", i);
           jit_value_t jit_param = jit_value_get_param (fn, i++);
           newenv = imp_assoc(newenv, imp_first(it), imp_pointer(jit_param));
         }
 
-        jit_value_t result = compile(newenv, fn, body);
+        imp_object newcaptures = NULL;
+        jit_value_t result = compile(&newcaptures, newenv, fn, body);
         jit_insn_return(fn, result);
         if (!jit_function_compile(fn)) {
           fprintf(stderr, "JIT compilation error\n");
           exit(1);
         }
         jit_dump_function(stdout, fn, NULL);
-        imp_object ifn = imp_fn(jit_function_to_vtable_pointer(fn), nparams);
-        return jit_value_create_nint_constant (function, jit_type_nint, (jit_nint)ifn);
+
+        //
+        // construct the closure object
+        //
+        int closure_size = 0;
+        if (newcaptures != NULL) {
+          closure_size = (int)imp_second(imp_first(newcaptures)) + 1;
+        }
+        jit_value_t closure = emit_malloc(function, sizeof(void*) * closure_size);
+
+        // save vtable pointer
+        jit_value_t vtableptr = jit_value_create_nint_constant (function, jit_type_nint, (jit_nint)jit_function_to_vtable_pointer(fn));       
+        jit_insn_store_relative (function, closure, 0, vtableptr);
+
+        // save captures
+        for (imp_object entry = newcaptures; entry != NULL; entry = imp_rest(entry)) {
+          imp_object pair = imp_first(entry);
+          if (pair == NULL) { /* end of frame */
+            break;
+          }
+          imp_object key = imp_first(pair);
+          int idx = (int)imp_second(pair);
+          printf("store %s @ %d\n", key->fields.symbol.name, idx);
+          jit_value_t value = compile(captures, env, function, key);
+          jit_insn_store_relative (function, closure, idx * sizeof(void*), value);
+        }
+
+        return closure;
       }
     }
-    jit_value_t fcompiled = compile(env, function, f);
+
+    // application
+    jit_value_t fcompiled = compile(captures, env, function, f);
     int nargs = imp_count(imp_rest(form));
-    jit_value_t *args = malloc(sizeof(jit_value_t) * nargs);
-    int i = 0;
+    jit_value_t *args = malloc(sizeof(jit_value_t) * (nargs + 1));
+    args[0] = fcompiled;
+    int i = 1;
     for (imp_object it = imp_rest(form); it != NULL; it = imp_rest(it)) {
       imp_object arg = imp_first(it);
-      args[i++] = compile(env, function, arg);
+      args[i++] = compile(captures, env, function, arg);
     }
-    int offset = offsetof(imp_object_struct, fields.fn.jit_fn);
-    jit_value_t vtableptr = jit_insn_load_relative (function, fcompiled, offset, jit_type_void_ptr);
-    return jit_insn_call_indirect_vtable(function, vtableptr, fn_signature(nargs), args, nargs, 0);
+    jit_value_t vtableptr = jit_insn_load_relative (function, fcompiled, 0, jit_type_void_ptr);
+    return jit_insn_call_indirect_vtable(function, vtableptr, fn_signature(nargs + 1), args, nargs + 1, 0);
   } else if (imp_type_of(form) == SYMBOL) {
-    imp_object value = lookup(env, form);
-    if (value != NULL && imp_type_of(value) == POINTER) {
-      return value->fields.pointer;
-    } else {
-      fprintf(stderr, "unbound: %s\n", form->fields.symbol.name);
-      exit(1);
+    // lookup in local environment
+    imp_object entry = env;
+    for (; entry != NULL; entry = imp_rest(entry)) {
+      imp_object pair = imp_first(entry);
+      if (pair == NULL) { /* end of frame */
+        break;
+      }
+      imp_object key = imp_first(pair);
+      imp_object value = imp_second(pair);
+      if (imp_equals(key, form) && imp_type_of(value) == POINTER) {
+        return value->fields.pointer;
+      }
     }
+
+    // lookup in parent environments
+    for (; entry != NULL; entry = imp_rest(entry)) {
+      imp_object pair = imp_first(entry);
+      if (pair == NULL) continue;
+      imp_object key = imp_first(pair);
+      if (imp_equals(key, form)) {
+        // add it to teh closure
+        int idx = *captures == NULL ? 0 : (int)imp_second(imp_first(*captures));
+        idx++;
+        *captures = imp_assoc(*captures, key, (void*) (long) idx);
+        jit_value_t closure_arg = jit_value_get_param (function, 0);
+        printf("load %s @ %d\n", key->fields.symbol.name, idx);
+        //return jit_value_create_nint_constant (function, jit_type_nint, (jit_nint)1);
+        return jit_insn_load_relative (function, closure_arg, idx * sizeof(void*), jit_type_void_ptr);
+      }
+    }
+    fprintf(stderr, "unbound: %s\n", form->fields.symbol.name);
+    exit(1);
   } else {
     return jit_value_create_nint_constant (function, jit_type_nint, (jit_nint)form);
   }
@@ -367,7 +445,8 @@ imp_object eval(jit_context_t context, imp_object form) {
   jit_context_build_start(context);
   jit_type_t signature = jit_type_create_signature(jit_abi_cdecl, jit_type_void_ptr, NULL, 0, 1);
   jit_function_t function = jit_function_create(context, signature);
-  jit_value_t result = compile(NULL, function, form);  
+  imp_object captures = NULL;
+  jit_value_t result = compile(&captures, NULL, function, form);  
   jit_insn_return(function, result);
   jit_context_build_end(context);
   if (!jit_function_compile(function)) {
@@ -382,6 +461,7 @@ imp_object eval(jit_context_t context, imp_object form) {
 
 int main() {
   jit_context_t context = jit_context_create();
+  //print_obj(sread());
   print_obj(eval(context, sread()));
   //print_obj(imp_cons(imp_symbol("a"), imp_cons(imp_symbol("b"), NULL)));
   printf("\n");
@@ -389,3 +469,4 @@ int main() {
   jit_context_destroy(context);
   return 0;
 }
+
