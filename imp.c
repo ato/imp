@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int debug = 0;
+
 typedef enum {
     CHARACTER,
     SYMBOL,
@@ -35,8 +37,8 @@ typedef struct imp_object_struct {
         } cons;
         void *pointer;
         struct {
-            void *jit_fn;
-            int nargs;
+            void *entrypoint;
+            int arity;
             imp_object closure[];
         } fn;
     } fields;
@@ -47,6 +49,11 @@ static imp_object_struct LPAREN = {.type = CHARACTER, .fields = { .character = '
 static imp_object_struct RPAREN = {.type = CHARACTER, .fields = { .character = ')'}};
 
 static const int MAX_NAME_LEN = 128;
+static const imp_object END_OF_FRAME = NULL;
+static const imp_object EMPTY_LIST = NULL;
+
+// forward decleration
+jit_value_t compile(imp_object *captures, imp_object env, jit_function_t function, imp_object form);
 
 imp_object imp_symbol(const char *name) {
     assert(name);
@@ -70,14 +77,6 @@ imp_object imp_pointer(void *value) {
     pointer->type = POINTER;
     pointer->fields.pointer = value;
     return pointer;
-}
-
-imp_object imp_fn(void *jit_fn, int nargs) {
-    imp_object fn = malloc(sizeof(imp_object_struct));
-    fn->type = FN;
-    fn->fields.fn.jit_fn = jit_fn;
-    fn->fields.fn.nargs = nargs;
-    return fn;
 }
 
 imp_object imp_fixnum(int64_t value) {
@@ -225,7 +224,8 @@ void print_obj(imp_object object) {
         printf(")");
         break;
     case FN:
-        printf("#fn %p", object);
+        printf("#fn {:entrypoint %p :arity %d}", object->fields.fn.entrypoint,
+               object->fields.fn.arity);
         break;
     }
 }
@@ -294,6 +294,104 @@ jit_value_t emit_malloc(jit_function_t function, int size) {
     return jit_insn_call_native (function, "malloc", (void *)malloc, signature, args, 1, 0);
 }
 
+/**
+ * Extends the lexical environment for a new fn by adding the end of
+ * frame marker and a list of parameters bound to jit param values.
+ *
+ * Leaves jit param 0 untouched for the closure.
+ */
+static imp_object extend_env_with_params(jit_function_t fn, imp_object env,
+                                         imp_object params) {
+    imp_object newenv = imp_cons(END_OF_FRAME, env);
+    int i = 1;
+    for (imp_object it = params; it != NULL; it = imp_rest(it)) {
+        jit_value_t jit_param = jit_value_get_param (fn, i++);
+        newenv = imp_assoc(newenv, imp_first(it), imp_pointer(jit_param));
+    }
+    return newenv;
+}
+
+static void die(char *message) {
+    fprintf(stderr, "%s\n", message);
+    abort();
+}
+
+/**
+ * JIT compiles a function.
+ */
+static jit_function_t compile_fn(jit_context_t jitctx, imp_object params,
+                                 imp_object body, imp_object env,
+                                 imp_object *enclosed) {
+    int nparams = imp_count(params) + 1;
+    jit_function_t jitfn = jit_function_create(jitctx, fn_signature(nparams));
+    imp_object newenv = extend_env_with_params(jitfn, env, params);
+    jit_value_t result = compile(enclosed, newenv, jitfn, body);
+    jit_insn_return(jitfn, result);
+    if (!jit_function_compile(jitfn))
+        die("JIT compilation failed");
+    if (debug)
+        jit_dump_function(stdout, jitfn, NULL);
+    return jitfn;
+}
+
+
+/**
+ * Emits code that constructs the Fn closure object for a function.
+ *
+ * An Fn object has this structure:
+ *
+ *     +---------------------+
+ *     | object type tag FN  |
+ *     +---------------------+
+ *     | code entrypoint ptr |
+ *     +---------------------+
+ *     | arity               |
+ *     +---------------------+
+ *     | closed over value 1 |
+ *     +---------------------+
+ *                :
+ *     +---------------------+
+ *     | closed over value N |
+ *     +---------------------+
+ *
+ */
+static jit_value_t emit_closure(jit_function_t fn, imp_object env,
+                                jit_function_t newfn, int arity,
+                                imp_object newenclosed, imp_object *enclosed) {
+    // allocate space for the object
+    int enclosed_count = imp_count(newenclosed);
+    int size = offsetof(imp_object_struct, fields.fn.closure) + 
+        sizeof(void*) * enclosed_count;
+    jit_value_t obj = emit_malloc(fn, size);
+    
+    // fill in object type
+    jit_value_t tag = jit_value_create_nint_constant(fn, jit_type_int, FN);
+    jit_insn_store_relative(fn, obj, offsetof(imp_object_struct, type), tag);
+
+    // fill in function entrypoint pointer
+    jit_nint entrypoint = (jit_nint)jit_function_to_closure(newfn);
+    jit_value_t ptr = jit_value_create_nint_constant(fn, jit_type_nint, entrypoint);
+    jit_insn_store_relative(fn, obj, offsetof(imp_object_struct,
+                                                fields.fn.entrypoint), ptr);
+    // fill in arity
+    jit_value_t arityc = jit_value_create_nint_constant(fn, jit_type_int, arity);
+    jit_insn_store_relative(fn, obj, offsetof(imp_object_struct,
+                                              fields.fn.arity), arityc);
+    
+    // fill in closed over values
+    // XXX - could represent enclosed as a vector so that we don't have to do
+    //       this in reverse
+    int offset = size - sizeof(void*);
+    for (imp_object entry = newenclosed; entry != NULL; entry = imp_rest(entry)) {
+        imp_object symbol = imp_first(imp_first(entry));
+        jit_value_t value = compile(enclosed, env, fn, symbol);
+        jit_insn_store_relative (fn, obj, offset, value);
+        offset -= sizeof(void*);
+    }
+
+    return obj;
+}
+
 jit_value_t compile(imp_object *captures, imp_object env, jit_function_t function, imp_object form) {
     if (imp_type_of(form) == CONS) {
         imp_object f = imp_first(form);
@@ -340,106 +438,63 @@ jit_value_t compile(imp_object *captures, imp_object env, jit_function_t functio
             } else if (!strcmp(fname, "fn")) { // (fn (x y z) ...)
                 imp_object params = imp_second(form);
                 imp_object body = imp_third(form);
-                int nparams = imp_count(params) + 1; // +1 for closure param
-                jit_type_t signature = fn_signature(nparams);
-                jit_function_t fn = jit_function_create(jit_function_get_context(function), signature);
-
-                // add end of frame marker to environment
-                imp_object newenv = imp_cons(NULL, env);
-                int i = 1;
-                for (imp_object it = params; it != NULL; it = imp_rest(it)) {
-                    printf("param @%d\n", i);
-                    jit_value_t jit_param = jit_value_get_param (fn, i++);
-                    newenv = imp_assoc(newenv, imp_first(it), imp_pointer(jit_param));
-                }
-
-                imp_object newcaptures = NULL;
-                jit_value_t result = compile(&newcaptures, newenv, fn, body);
-                jit_insn_return(fn, result);
-                if (!jit_function_compile(fn)) {
-                    fprintf(stderr, "JIT compilation error\n");
-                    exit(1);
-                }
-                jit_dump_function(stdout, fn, NULL);
-
-                //
-                // construct the closure object
-                //
-                int closure_size = 0;
-                if (newcaptures != NULL) {
-                    closure_size = (int)imp_second(imp_first(newcaptures)) + 1;
-                }
-                jit_value_t closure = emit_malloc(function, sizeof(void*) * closure_size);
-
-                // save vtable pointer
-                jit_value_t vtableptr = jit_value_create_nint_constant (function, jit_type_nint, (jit_nint)jit_function_to_vtable_pointer(fn));       
-                jit_insn_store_relative (function, closure, 0, vtableptr);
-
-                // save captures
-                for (imp_object entry = newcaptures; entry != NULL; entry = imp_rest(entry)) {
-                    imp_object pair = imp_first(entry);
-                    if (pair == NULL) { /* end of frame */
-                        break;
-                    }
-                    imp_object key = imp_first(pair);
-                    int idx = (int)imp_second(pair);
-                    printf("store %s @ %d\n", key->fields.symbol.name, idx);
-                    jit_value_t value = compile(captures, env, function, key);
-                    jit_insn_store_relative (function, closure, idx * sizeof(void*), value);
-                }
-
-                return closure;
+                imp_object newenclosed = EMPTY_LIST;
+                jit_function_t newfn = compile_fn(jit_function_get_context(function),
+                                                  params, body, env, &newenclosed);
+                return emit_closure(function, env, newfn, imp_count(params),
+                                    newenclosed, captures);
+            }
         }
-    }
 
-    // application
-    jit_value_t fcompiled = compile(captures, env, function, f);
-    int nargs = imp_count(imp_rest(form));
-    jit_value_t *args = malloc(sizeof(jit_value_t) * (nargs + 1));
-    args[0] = fcompiled;
-    int i = 1;
-    for (imp_object it = imp_rest(form); it != NULL; it = imp_rest(it)) {
-        imp_object arg = imp_first(it);
-        args[i++] = compile(captures, env, function, arg);
-    }
-    jit_value_t vtableptr = jit_insn_load_relative (function, fcompiled, 0, jit_type_void_ptr);
-    return jit_insn_call_indirect_vtable(function, vtableptr, fn_signature(nargs + 1), args, nargs + 1, 0);
-} else if (imp_type_of(form) == SYMBOL) {
-    // lookup in local environment
-    imp_object entry = env;
-    for (; entry != NULL; entry = imp_rest(entry)) {
-        imp_object pair = imp_first(entry);
-        if (pair == NULL) { /* end of frame */
-            break;
+        // application
+        jit_value_t fcompiled = compile(captures, env, function, f);
+        int nargs = imp_count(imp_rest(form));
+        jit_value_t *args = malloc(sizeof(jit_value_t) * (nargs + 1));
+        args[0] = fcompiled;
+        int i = 1;
+        for (imp_object it = imp_rest(form); it != NULL; it = imp_rest(it)) {
+            imp_object arg = imp_first(it);
+            args[i++] = compile(captures, env, function, arg);
         }
-        imp_object key = imp_first(pair);
-        imp_object value = imp_second(pair);
-        if (imp_equals(key, form) && imp_type_of(value) == POINTER) {
-            return value->fields.pointer;
+        jit_value_t ptr = jit_insn_load_relative (function, fcompiled,
+                                                        offsetof(imp_object_struct,
+                                                                 fields.fn.entrypoint), jit_type_void_ptr);
+        return jit_insn_call_indirect(function, ptr, fn_signature(nargs + 1), args, nargs + 1, 0);
+    } else if (imp_type_of(form) == SYMBOL) {
+        // lookup in local environment
+        imp_object entry = env;
+        for (; entry != NULL; entry = imp_rest(entry)) {
+            imp_object pair = imp_first(entry);
+            if (pair == NULL) { /* end of frame */
+                break;
+            }
+            imp_object key = imp_first(pair);
+            imp_object value = imp_second(pair);
+            if (imp_equals(key, form) && imp_type_of(value) == POINTER) {
+                return value->fields.pointer;
+            }
         }
-    }
 
-    // lookup in parent environments
-    for (; entry != NULL; entry = imp_rest(entry)) {
-        imp_object pair = imp_first(entry);
-        if (pair == NULL) continue;
-        imp_object key = imp_first(pair);
-        if (imp_equals(key, form)) {
-            // add it to teh closure
-            int idx = *captures == NULL ? 0 : (int)imp_second(imp_first(*captures));
-            idx++;
-            *captures = imp_assoc(*captures, key, (void*) (long) idx);
-            jit_value_t closure_arg = jit_value_get_param (function, 0);
-            printf("load %s @ %d\n", key->fields.symbol.name, idx);
-            //return jit_value_create_nint_constant (function, jit_type_nint, (jit_nint)1);
-            return jit_insn_load_relative (function, closure_arg, idx * sizeof(void*), jit_type_void_ptr);
+        // lookup in parent environments
+        for (; entry != NULL; entry = imp_rest(entry)) {
+            imp_object pair = imp_first(entry);
+            if (pair == NULL) continue;
+            imp_object key = imp_first(pair);
+            if (imp_equals(key, form)) {
+                // add it to teh closure
+                int idx = *captures == NULL ? -1 : (int)imp_second(imp_first(*captures));
+                idx++;
+                *captures = imp_assoc(*captures, key, (void*) (long) idx);
+                jit_value_t closure_arg = jit_value_get_param (function, 0);
+                int offset = offsetof(imp_object_struct, fields.fn.closure[idx]);
+                return jit_insn_load_relative (function, closure_arg, offset, jit_type_void_ptr);
+            }
         }
+        fprintf(stderr, "unbound: %s\n", form->fields.symbol.name);
+        exit(1);
+    } else {
+        return jit_value_create_nint_constant (function, jit_type_nint, (jit_nint)form);
     }
-    fprintf(stderr, "unbound: %s\n", form->fields.symbol.name);
-    exit(1);
- } else {
-    return jit_value_create_nint_constant (function, jit_type_nint, (jit_nint)form);
- }
 }
 
 imp_object eval(jit_context_t context, imp_object form) {
@@ -454,13 +509,19 @@ imp_object eval(jit_context_t context, imp_object form) {
         fprintf(stderr, "JIT compilation error\n");
         return NULL;
     }
-    jit_dump_function(stdout, function, NULL);
+    if (debug)
+        jit_dump_function(stdout, function, NULL);
     imp_object result2;
     jit_function_apply(function, NULL, &result2);
     return result2;
 }
 
-int main() {
+int main (int argc, char *argv[]) {
+
+    if (argc > 1) {
+        debug = 1;
+    }
+
     jit_context_t context = jit_context_create();
     //print_obj(sread());
     print_obj(eval(context, sread()));
