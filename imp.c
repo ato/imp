@@ -52,8 +52,8 @@ static const int MAX_NAME_LEN = 128;
 static const imp_object END_OF_FRAME = NULL;
 static const imp_object EMPTY_LIST = NULL;
 
-// forward decleration
-jit_value_t compile(imp_object *captures, imp_object env, jit_function_t function, imp_object form);
+// forward declaration
+jit_value_t compile(imp_object env, jit_function_t function, imp_object form, imp_object *enclosed);
 
 imp_object imp_symbol(const char *name) {
     assert(name);
@@ -325,7 +325,7 @@ static jit_function_t compile_fn(jit_context_t jitctx, imp_object params,
     int nparams = imp_count(params) + 1;
     jit_function_t jitfn = jit_function_create(jitctx, fn_signature(nparams));
     imp_object newenv = extend_env_with_params(jitfn, env, params);
-    jit_value_t result = compile(enclosed, newenv, jitfn, body);
+    jit_value_t result = compile(newenv, jitfn, body, enclosed);
     jit_insn_return(jitfn, result);
     if (!jit_function_compile(jitfn))
         die("JIT compilation failed");
@@ -341,17 +341,17 @@ static jit_function_t compile_fn(jit_context_t jitctx, imp_object params,
  * An Fn object has this structure:
  *
  *     +---------------------+
- *     | object type tag FN  |
+ *     | object type tag FN  | int
+ *     +---------------------+ 
+ *     | code entrypoint ptr | pointer
  *     +---------------------+
- *     | code entrypoint ptr |
+ *     | arity               | int
  *     +---------------------+
- *     | arity               |
- *     +---------------------+
- *     | closed over value 1 |
+ *     | closed over value 1 | pointer
  *     +---------------------+
  *                :
  *     +---------------------+
- *     | closed over value N |
+ *     | closed over value N | pointer
  *     +---------------------+
  *
  */
@@ -384,7 +384,7 @@ static jit_value_t emit_closure(jit_function_t fn, imp_object env,
     int offset = size - sizeof(void*);
     for (imp_object entry = newenclosed; entry != NULL; entry = imp_rest(entry)) {
         imp_object symbol = imp_first(imp_first(entry));
-        jit_value_t value = compile(enclosed, env, fn, symbol);
+        jit_value_t value = compile(env, fn, symbol, enclosed);
         jit_insn_store_relative (fn, obj, offset, value);
         offset -= sizeof(void*);
     }
@@ -392,49 +392,61 @@ static jit_value_t emit_closure(jit_function_t fn, imp_object env,
     return obj;
 }
 
-jit_value_t compile(imp_object *captures, imp_object env, jit_function_t function, imp_object form) {
+static jit_value_t emit_fixnum2int(jit_function_t fn, jit_value_t fixnum) {
+   jit_value_t one = jit_value_create_nint_constant(fn, jit_type_nint, 1);
+   return jit_insn_shr(fn, fixnum, one);
+}
+
+static jit_value_t emit_int2fixnum(jit_function_t fn, jit_value_t fixnum) {
+   jit_value_t one = jit_value_create_nint_constant(fn, jit_type_nint, 1);
+   jit_value_t shifted = jit_insn_shl(fn, fixnum, one);
+   return jit_insn_or(fn, shifted, one);
+}
+
+static jit_value_t emit_binop(jit_function_t fn, imp_object env, int op, 
+                              imp_object form, imp_object *enclosed) {
+    jit_value_t x = compile(env, fn, imp_second(form), enclosed);
+    jit_value_t y = compile(env, fn, imp_third(form), enclosed);
+    jit_value_t one = jit_value_create_nint_constant(fn, jit_type_nint, 1);
+    // addition can be done without conversion
+    if (op == '+')
+        return jit_insn_sub(fn, jit_insn_add(fn, x, y), one);
+    if (op == '-')
+        return jit_insn_add(fn, jit_insn_sub(fn, x, y), one);
+
+    // everything else needs conversion first
+    x = emit_fixnum2int(fn, x);
+    y = emit_fixnum2int(fn, y);
+    jit_value_t result;
+    switch (op) {
+    case '*': result = jit_insn_div(fn, x, y); break;
+    case '/': result = jit_insn_mul(fn, x, y); break;
+    default: die("unhandled binop"); break;
+    }
+    return emit_int2fixnum(fn, result);
+}
+
+jit_value_t compile(imp_object env, jit_function_t function, imp_object form, imp_object *enclosed) {
     if (imp_type_of(form) == CONS) {
         imp_object f = imp_first(form);
         if (imp_type_of(f) == SYMBOL) {
             char *fname = f->fields.symbol.name;
             if (!strcmp(fname, "+")) {
-                jit_value_t x = compile(captures, env, function, imp_second(form));
-                jit_value_t y = compile(captures, env, function, imp_third(form));
-                jit_value_t tmp = jit_insn_add(function, x, y);
-                jit_value_t one = jit_value_create_nint_constant(function, jit_type_nint, 1);
-                return jit_insn_sub(function, tmp, one);
+                return emit_binop(function, env, '+', form, enclosed);
             } else if (!strcmp(fname, "-")) {
-                jit_value_t x = compile(captures, env, function, imp_second(form));
-                jit_value_t y = compile(captures, env, function, imp_third(form));
-                jit_value_t tmp = jit_insn_sub(function, x, y);
-                jit_value_t one = jit_value_create_nint_constant(function, jit_type_nint, 1);
-                return jit_insn_add(function, tmp, one);
+                return emit_binop(function, env, '-', form, enclosed);
             } else if (!strcmp(fname, "*")) {
-                jit_value_t x = compile(captures, env, function, imp_second(form));
-                jit_value_t y = compile(captures, env, function, imp_third(form));
-                jit_value_t one = jit_value_create_nint_constant(function, jit_type_nint, 1);
-                jit_value_t x1 = jit_insn_shr(function, x, one);
-                jit_value_t y1 = jit_insn_shr(function, y, one);
-                jit_value_t tmp1 = jit_insn_mul(function, x1, y1);
-                jit_value_t tmp = jit_insn_shl(function, tmp1, one);
-                return jit_insn_add(function, tmp, one);
+                return emit_binop(function, env, '*', form, enclosed);
             } else if (!strcmp(fname, "/")) {
-                jit_value_t x = compile(captures, env, function, imp_second(form));
-                jit_value_t y = compile(captures, env, function, imp_third(form));
-                jit_value_t one = jit_value_create_nint_constant(function, jit_type_nint, 1);
-                jit_value_t x1 = jit_insn_shr(function, x, one);
-                jit_value_t y1 = jit_insn_shr(function, y, one);
-                jit_value_t tmp1 = jit_insn_div(function, x1, y1);
-                jit_value_t tmp = jit_insn_shl(function, tmp1, one);
-                return jit_insn_add(function, tmp, one);
+                return emit_binop(function, env, '/', form, enclosed);
             } else if (!strcmp(fname, "let")) { // (let (x 2) ...)
                 imp_object bindings = imp_second(form);
                 imp_object body = imp_third(form);
                 imp_object bindname = imp_first(bindings);
                 imp_object bindvalue = imp_second(bindings);
-                jit_value_t jitvalue = compile(captures, env, function, bindvalue);
+                jit_value_t jitvalue = compile(env, function, bindvalue, enclosed);
                 env = imp_assoc(env, bindname, imp_pointer(jitvalue));
-                return compile(captures, env, function, body);
+                return compile(env, function, body, enclosed);
             } else if (!strcmp(fname, "fn")) { // (fn (x y z) ...)
                 imp_object params = imp_second(form);
                 imp_object body = imp_third(form);
@@ -442,19 +454,19 @@ jit_value_t compile(imp_object *captures, imp_object env, jit_function_t functio
                 jit_function_t newfn = compile_fn(jit_function_get_context(function),
                                                   params, body, env, &newenclosed);
                 return emit_closure(function, env, newfn, imp_count(params),
-                                    newenclosed, captures);
+                                    newenclosed, enclosed);
             }
         }
 
         // application
-        jit_value_t fcompiled = compile(captures, env, function, f);
+        jit_value_t fcompiled = compile(env, function, f, enclosed);
         int nargs = imp_count(imp_rest(form));
         jit_value_t *args = malloc(sizeof(jit_value_t) * (nargs + 1));
         args[0] = fcompiled;
         int i = 1;
         for (imp_object it = imp_rest(form); it != NULL; it = imp_rest(it)) {
             imp_object arg = imp_first(it);
-            args[i++] = compile(captures, env, function, arg);
+            args[i++] = compile(env, function, arg, enclosed);
         }
         jit_value_t ptr = jit_insn_load_relative (function, fcompiled,
                                                         offsetof(imp_object_struct,
@@ -482,9 +494,9 @@ jit_value_t compile(imp_object *captures, imp_object env, jit_function_t functio
             imp_object key = imp_first(pair);
             if (imp_equals(key, form)) {
                 // add it to teh closure
-                int idx = *captures == NULL ? -1 : (int)imp_second(imp_first(*captures));
+                int idx = *enclosed == NULL ? -1 : (int)imp_second(imp_first(*enclosed));
                 idx++;
-                *captures = imp_assoc(*captures, key, (void*) (long) idx);
+                *enclosed = imp_assoc(*enclosed, key, (void*) (long) idx);
                 jit_value_t closure_arg = jit_value_get_param (function, 0);
                 int offset = offsetof(imp_object_struct, fields.fn.closure[idx]);
                 return jit_insn_load_relative (function, closure_arg, offset, jit_type_void_ptr);
@@ -501,8 +513,8 @@ imp_object eval(jit_context_t context, imp_object form) {
     jit_context_build_start(context);
     jit_type_t signature = jit_type_create_signature(jit_abi_cdecl, jit_type_void_ptr, NULL, 0, 1);
     jit_function_t function = jit_function_create(context, signature);
-    imp_object captures = NULL;
-    jit_value_t result = compile(&captures, NULL, function, form);  
+    imp_object enclosed = NULL;
+    jit_value_t result = compile(NULL, function, form, &enclosed);  
     jit_insn_return(function, result);
     jit_context_build_end(context);
     if (!jit_function_compile(function)) {
