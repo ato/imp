@@ -1,6 +1,7 @@
 from subprocess import Popen, PIPE
 
 tests = [('2', '2'),
+         ('(* 3 4)', '12'),
          ('(( (let (x 2) (fn () (fn () x))) ))', '2'),
          ('(let (x 4) (+ (+ x x) 1))', '9'),
          ('((let (x 4) (fn (y) (+ (+ x y) 1))) 2)', '7'),

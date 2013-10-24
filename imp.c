@@ -8,274 +8,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "object.h"
+
+
 static int debug = 0;
 
-typedef enum {
-    CHARACTER,
-    SYMBOL,
-    CONS,
-    NUMBER,
-    FIXNUM,
-    POINTER,
-    FN,
-    NIL,
-} imp_object_type;
-
-typedef struct imp_object_struct *imp_object;
-
-typedef struct imp_object_struct {
-    imp_object_type type;
-    union {
-        int character;
-        int64_t number;
-        struct {
-            char *name;
-        } symbol;
-        struct {
-            imp_object head;
-            imp_object tail;
-        } cons;
-        void *pointer;
-        struct {
-            void *entrypoint;
-            int arity;
-            imp_object closure[];
-        } fn;
-    } fields;
-} imp_object_struct;
-
-static imp_object_struct END_OF_INPUT = {.type = CHARACTER, .fields = { .character = EOF, }};
-static imp_object_struct LPAREN = {.type = CHARACTER, .fields = { .character = '('}};
-static imp_object_struct RPAREN = {.type = CHARACTER, .fields = { .character = ')'}};
-
-static const int MAX_NAME_LEN = 128;
 static const imp_object END_OF_FRAME = NULL;
-static const imp_object EMPTY_LIST = NULL;
 
 // forward declaration
 jit_value_t compile(imp_object env, jit_function_t function, imp_object form, imp_object *enclosed);
 
-imp_object imp_symbol(const char *name) {
-    assert(name);
-    char *symbol_name = malloc(strlen(name) + 1);
-    imp_object symbol = malloc(sizeof(imp_object_struct));
-    symbol->type = SYMBOL;
-    strcpy(symbol_name, name);
-    symbol->fields.symbol.name = symbol_name;
-    return symbol;
-}
-
-imp_object imp_number(int64_t value) {
-    imp_object number = malloc(sizeof(imp_object_struct));
-    number->type = NUMBER;
-    number->fields.number = value;
-    return number;
-}
-
-imp_object imp_pointer(void *value) {
-    imp_object pointer = malloc(sizeof(imp_object_struct));
-    pointer->type = POINTER;
-    pointer->fields.pointer = value;
-    return pointer;
-}
-
-imp_object imp_fixnum(int64_t value) {
-    return (imp_object) ((value << 1) | 1);
-}
-
-int imp_is_fixnum(imp_object x) {
-    return ((uint64_t)x) & 1;
-}
-
-int64_t imp_cint(imp_object x) {
-    if (imp_is_fixnum(x)) {
-        return ((int64_t)x) >> 1;
-    }
-    assert(x->type == NUMBER);
-    return x->fields.number;
-}
-
-imp_object_type imp_type_of(imp_object object) {
-    if (object == NULL) {
-        return NIL;
-    } else if (imp_is_fixnum(object)) {
-        return FIXNUM;
-    }
-    return object->type;
-}
-
-imp_object imp_cons(imp_object head, imp_object tail) {
-    imp_object cell = malloc(sizeof(imp_object_struct));
-    cell->type = CONS;
-    cell->fields.cons.head = head;
-    cell->fields.cons.tail = tail;
-    return cell;
-}
-
-imp_object imp_pair(imp_object x, imp_object y) {
-    return imp_cons(x, imp_cons(y, NULL));
-}
-
-imp_object imp_first(imp_object list) {
-    assert(list->type = CONS);
-    return list->fields.cons.head;
-}
-
-imp_object imp_rest(imp_object list) {
-    assert(list->type = CONS);
-    return list->fields.cons.tail;
-}
-
-imp_object imp_second(imp_object list) {
-    return imp_first(imp_rest(list));
-}
-
-imp_object imp_third(imp_object list) {
-    return imp_first(imp_rest(imp_rest(list)));
-}
-
-int imp_count(imp_object list) {
-    int n = 0;
-    while (list != NULL) {
-        n++;
-        list = imp_rest(list);
-    }
-    return n;
-}
-
-int imp_equals(imp_object x, imp_object y) {
-    if (x == y)
-        return 1;
-    if (x == NULL || y == NULL)
-        return 0;
-    if (imp_type_of(x) != imp_type_of(y))
-        return 0;
-    switch (imp_type_of(x)) {
-    case FIXNUM: return x == y;
-    case NUMBER: return x->fields.number == y->fields.number;
-    case POINTER: return x->fields.pointer == y->fields.pointer;
-    case CHARACTER: return x->fields.character == y->fields.character;
-    case SYMBOL: return !strcmp(x->fields.symbol.name, y->fields.symbol.name);
-    case CONS: return imp_equals(imp_first(x), imp_first(y)) && imp_equals(imp_rest(x), imp_rest(y));
-    case NIL:
-    case FN: return x == y;
-    }
-}
-
-static imp_object read_token() {
-    int c;
-    do {
-        c = getchar();
-        if (c == ';') {
-            do {
-                c = getchar();
-            } while (c != '\n' && c != EOF);
-        }
-    } while (isspace(c));
-
-    switch (c) {
-    case EOF: return &END_OF_INPUT;
-    case '(': return &LPAREN;
-    case ')': return &RPAREN;
-    default:
-        {
-            char name[MAX_NAME_LEN];
-            char *pname = name;
-            do {
-                *pname++ = c;
-                c = getchar();
-            } while (c != EOF && !isspace(c) && c != '(' && c != ')');
-            ungetc(c, stdin);
-            *pname = '\0';
-            if (isdigit(name[0])) {
-                return imp_fixnum(strtoll(name, NULL, 10));
-            } else {
-                return imp_symbol(name);
-            }
-        }
-    }
-}
-
-void print_obj(imp_object object) {
-    switch (imp_type_of(object)) {
-    case NIL:
-        printf("nil");
-        return;
-    case CHARACTER:
-        printf("\\%c", object->fields.character);
-        break;
-    case SYMBOL:
-        printf("%s", object->fields.symbol.name);
-        break;
-    case FIXNUM:
-    case NUMBER:
-        printf("%ld", imp_cint(object));
-        break;
-    case POINTER:
-        printf("#pointer %p", object->fields.pointer);
-        break;
-    case CONS:
-        printf("(");
-        print_obj(imp_first(object));
-        for (imp_object tail = imp_rest(object); tail != NULL && tail->type == CONS; tail = imp_rest(tail)) {
-            printf(" ");
-            print_obj(imp_first(tail));
-        }
-        printf(")");
-        break;
-    case FN:
-        printf("#fn {:entrypoint %p :arity %d}", object->fields.fn.entrypoint,
-               object->fields.fn.arity);
-        break;
-    }
-}
-
-imp_object sread();
-
-imp_object sread_tail() {
-    imp_object form = read_token();
-    if (form == &END_OF_INPUT) {
-        fprintf(stderr, "unexpected EOF\n");
-        exit(1);
-    } else if (form == &RPAREN) {
-        return NULL;
-    } else if (form == &LPAREN) {
-        return imp_cons(sread_tail(), sread_tail());
-    } else {
-        return imp_cons(form, sread_tail());
-    }
-}
-
-imp_object sread() {
-    imp_object token = read_token();
-    if (token == &END_OF_INPUT) {
-        fprintf(stderr, "unexpected EOF\n");
-        exit(1);
-    } else if (token == &LPAREN) {
-        return sread_tail();
-    } else if (token == &RPAREN) {
-        fprintf(stderr, "unexpected )\n");
-        exit(1);
-    } else {
-        return token;
-    }
-}
-
-imp_object lookup(imp_object haystack, imp_object needle) {
-    for (imp_object entry = haystack; entry != NULL; entry = imp_rest(entry)) {
-        imp_object pair = imp_first(entry);
-        imp_object key = imp_first(pair);
-        imp_object value = imp_second(pair);
-        if (imp_equals(key, needle)) {
-            return value;
-        }
-    }
-    return NULL;
-}
-
-imp_object imp_assoc(imp_object m, imp_object k, imp_object v) {
-    return imp_cons(imp_pair(k, v), m);
-}
 
 static jit_type_t fn_signature(int nparams) {
     jit_type_t *params = malloc(sizeof(jit_type_t) * nparams);
@@ -285,7 +27,7 @@ static jit_type_t fn_signature(int nparams) {
     return jit_type_create_signature(jit_abi_cdecl, jit_type_void_ptr, params, nparams, 1);
 }
 
-jit_value_t emit_malloc(jit_function_t function, int size) {
+static jit_value_t emit_malloc(jit_function_t function, int size) {
     jit_type_t *params = malloc(sizeof(jit_type_t));
     params[0] = jit_type_ulong;
     jit_type_t signature = jit_type_create_signature(jit_abi_cdecl, jit_type_void_ptr, params, 1, 1);
@@ -405,6 +147,7 @@ static jit_value_t emit_int2fixnum(jit_function_t fn, jit_value_t fixnum) {
 
 static jit_value_t emit_binop(jit_function_t fn, imp_object env, int op, 
                               imp_object form, imp_object *enclosed) {
+    // XXX type checking
     jit_value_t x = compile(env, fn, imp_second(form), enclosed);
     jit_value_t y = compile(env, fn, imp_third(form), enclosed);
     jit_value_t one = jit_value_create_nint_constant(fn, jit_type_nint, 1);
@@ -419,8 +162,8 @@ static jit_value_t emit_binop(jit_function_t fn, imp_object env, int op,
     y = emit_fixnum2int(fn, y);
     jit_value_t result;
     switch (op) {
-    case '*': result = jit_insn_div(fn, x, y); break;
-    case '/': result = jit_insn_mul(fn, x, y); break;
+    case '/': result = jit_insn_div(fn, x, y); break;
+    case '*': result = jit_insn_mul(fn, x, y); break;
     default: die("unhandled binop"); break;
     }
     return emit_int2fixnum(fn, result);
@@ -439,6 +182,12 @@ jit_value_t compile(imp_object env, jit_function_t function, imp_object form, im
                 return emit_binop(function, env, '*', form, enclosed);
             } else if (!strcmp(fname, "/")) {
                 return emit_binop(function, env, '/', form, enclosed);
+            } else if (!strcmp(fname, "if")) { // (if cond true false)
+                imp_object condition = imp_nth(form, 1);
+                imp_object trueclause = imp_nth(form, 2);
+                imp_object falseclause = imp_nth(form, 3);
+                jit_label_t falselabel = jit_label_undefined;
+                
             } else if (!strcmp(fname, "let")) { // (let (x 2) ...)
                 imp_object bindings = imp_second(form);
                 imp_object body = imp_third(form);
@@ -535,9 +284,9 @@ int main (int argc, char *argv[]) {
     }
 
     jit_context_t context = jit_context_create();
-    //print_obj(sread());
-    print_obj(eval(context, sread()));
-    //print_obj(imp_cons(imp_symbol("a"), imp_cons(imp_symbol("b"), NULL)));
+    //imp_print(imp_read());
+    imp_print(eval(context, imp_read()));
+    //imp_print(imp_cons(imp_symbol("a"), imp_cons(imp_symbol("b"), NULL)));
     printf("\n");
 
     jit_context_destroy(context);
