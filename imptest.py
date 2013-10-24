@@ -6,6 +6,8 @@ tests = [('2', '2'),
          ('(( (let (x 2) (fn () (fn () x))) ))', '2'),
          ('(let (x 4) (+ (+ x x) 1))', '9'),
          ('((let (x 4) (fn (y) (+ (+ x y) 1))) 2)', '7'),
+         ('(if true 1 0)', '1'),
+         ('(if false 1 0)', '0'),
 ]
 
 for code, expected in tests:

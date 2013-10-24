@@ -103,7 +103,7 @@ imp_object imp_third(imp_object list) {
 
 imp_object imp_nth(imp_object list, int n) {
     int i;
-    for (i = 0; i < n && list; i++) {
+    for (i = 0; list; i++) {
         if (i == n) {
             return imp_first(list);            
         }
