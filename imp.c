@@ -145,8 +145,10 @@ static jit_value_t emit_int2fixnum(jit_function_t fn, jit_value_t fixnum) {
    return jit_insn_or(fn, shifted, one);
 }
 
-static jit_value_t emit_binop(jit_function_t fn, imp_object env, int op, 
+static jit_value_t emit_binop(jit_function_t fn, imp_object env,
                               imp_object form, imp_object *enclosed) {
+    char *opname = imp_symbol_cstr(imp_first(form));
+    int op = opname[0];
     // XXX type checking
     jit_value_t x = compile(env, fn, imp_second(form), enclosed);
     jit_value_t y = compile(env, fn, imp_third(form), enclosed);
@@ -169,74 +171,71 @@ static jit_value_t emit_binop(jit_function_t fn, imp_object env, int op,
     return emit_int2fixnum(fn, result);
 }
 
-jit_value_t compile(imp_object env, jit_function_t fn, imp_object form, imp_object *enclosed) {
-    if (imp_type_of(form) == CONS) {
-        imp_object f = imp_first(form);
-        if (imp_type_of(f) == SYMBOL) {
-            char *fname = f->fields.symbol.name;
-            if (!strcmp(fname, "+")) {
-                return emit_binop(fn, env, '+', form, enclosed);
-            } else if (!strcmp(fname, "-")) {
-                return emit_binop(fn, env, '-', form, enclosed);
-            } else if (!strcmp(fname, "*")) {
-                return emit_binop(fn, env, '*', form, enclosed);
-            } else if (!strcmp(fname, "/")) {
-                return emit_binop(fn, env, '/', form, enclosed);
-            } else if (!strcmp(fname, "if")) { // (if cond true false)
-                jit_label_t falselabel = jit_label_undefined;
-                jit_label_t endiflabel = jit_label_undefined;
-                jit_value_t falsevalue = jit_value_create_nint_constant(fn, 
-                                             jit_type_nint, (jit_nint) FALSE);
-                jit_value_t condition = compile(env, fn, imp_nth(form, 1), enclosed);
-                jit_value_t eq = jit_insn_eq(fn, condition, falsevalue);
-                jit_insn_branch_if(fn, eq, &falselabel);
+static jit_value_t emit_if(jit_function_t fn, imp_object env,
+                           imp_object form, imp_object *enclosed) {
+    jit_label_t falselabel = jit_label_undefined;
+    jit_label_t endiflabel = jit_label_undefined;
+    jit_value_t false = jit_value_create_nint_constant(fn, 
+                                                       jit_type_nint, (jit_nint) FALSE);
+    jit_value_t condition = compile(env, fn, imp_nth(form, 1), enclosed);
+    jit_value_t eq = jit_insn_eq(fn, condition, false);
+    jit_insn_branch_if(fn, eq, &falselabel);
 
-                // true clause
-                jit_value_t trueclause = compile(env, fn, imp_nth(form, 2), enclosed);
-                jit_value_t result = jit_value_create(fn, jit_type_void_ptr);
-                jit_insn_store(fn, result, trueclause);
-                jit_insn_branch(fn, &endiflabel);
+    // true clause
+    jit_value_t trueclause = compile(env, fn, imp_nth(form, 2), enclosed);
+    jit_value_t result = jit_value_create(fn, jit_type_void_ptr);
+    jit_insn_store(fn, result, trueclause);
+    jit_insn_branch(fn, &endiflabel);
 
-                // false clause
-                jit_insn_label(fn, &falselabel);
-                jit_value_t falseclause = compile(env, fn, imp_nth(form, 3), enclosed);
-                jit_insn_store(fn, result, falseclause);
-                jit_insn_label(fn, &endiflabel);
-                return result;                
-            } else if (!strcmp(fname, "let")) { // (let (x 2) ...)
-                imp_object bindings = imp_second(form);
-                imp_object body = imp_third(form);
-                imp_object bindname = imp_first(bindings);
-                imp_object bindvalue = imp_second(bindings);
-                jit_value_t jitvalue = compile(env, fn, bindvalue, enclosed);
-                env = imp_assoc(env, bindname, imp_pointer(jitvalue));
-                return compile(env, fn, body, enclosed);
+    // false clause
+    jit_insn_label(fn, &falselabel);
+    jit_value_t falseclause = compile(env, fn, imp_nth(form, 3), enclosed);
+    jit_insn_store(fn, result, falseclause);
+    jit_insn_label(fn, &endiflabel);
+    return result;
+}
 
-                imp_object params = imp_second(form);
-                imp_object body = imp_third(form);
-                imp_object newenclosed = EMPTY_LIST;
-                jit_function_t newfn = compile_fn(jit_function_get_context(fn),
-                                                  params, body, env, &newenclosed);
-                return emit_closure(fn, env, newfn, imp_count(params),
-                                    newenclosed, enclosed);
-            }
-        }
+static jit_value_t emit_let(jit_function_t fn, imp_object env,
+                            imp_object form, imp_object *enclosed) {
+    imp_object bindings = imp_second(form);
+    imp_object body = imp_third(form);
+    imp_object bindname = imp_first(bindings);
+    imp_object bindvalue = imp_second(bindings);
+    jit_value_t jitvalue = compile(env, fn, bindvalue, enclosed);
+    env = imp_assoc(env, bindname, imp_pointer(jitvalue));
+    return compile(env, fn, body, enclosed);
+}
 
-        // application
-        jit_value_t fcompiled = compile(env, fn, f, enclosed);
-        int nargs = imp_count(imp_rest(form));
-        jit_value_t *args = malloc(sizeof(jit_value_t) * (nargs + 1));
-        args[0] = fcompiled;
-        int i = 1;
-        for (imp_object it = imp_rest(form); it != NULL; it = imp_rest(it)) {
-            imp_object arg = imp_first(it);
-            args[i++] = compile(env, fn, arg, enclosed);
-        }
-        jit_value_t ptr = jit_insn_load_relative (fn, fcompiled,
-                                                        offsetof(imp_object_struct,
-                                                                 fields.fn.entrypoint), jit_type_void_ptr);
-        return jit_insn_call_indirect(fn, ptr, fn_signature(nargs + 1), args, nargs + 1, 0);
-    } else if (imp_type_of(form) == SYMBOL) {
+static jit_value_t emit_fn(jit_function_t fn, imp_object env,
+                           imp_object form, imp_object *enclosed) {
+    imp_object params = imp_second(form);
+    imp_object body = imp_third(form);
+    imp_object newenclosed = EMPTY_LIST;
+    jit_function_t newfn = compile_fn(jit_function_get_context(fn),
+                                      params, body, env, &newenclosed);
+    return emit_closure(fn, env, newfn, imp_count(params),
+                        newenclosed, enclosed);
+}
+
+static jit_value_t emit_application(jit_function_t fn, imp_object env,
+                           imp_object form, imp_object *enclosed) {
+    jit_value_t fcompiled = compile(env, fn, imp_first(form), enclosed);
+    int nargs = imp_count(imp_rest(form));
+    jit_value_t *args = malloc(sizeof(jit_value_t) * (nargs + 1));
+    args[0] = fcompiled;
+    int i = 1;
+    for (imp_object it = imp_rest(form); it != NULL; it = imp_rest(it)) {
+        imp_object arg = imp_first(it);
+        args[i++] = compile(env, fn, arg, enclosed);
+    }
+    jit_value_t ptr = jit_insn_load_relative (fn, fcompiled,
+                                              offsetof(imp_object_struct,
+                                                       fields.fn.entrypoint), jit_type_void_ptr);
+    return jit_insn_call_indirect(fn, ptr, fn_signature(nargs + 1), args, nargs + 1, 0);
+}
+
+static jit_value_t emit_resolve(jit_function_t fn, imp_object env,
+                           imp_object form, imp_object *enclosed) {
         // lookup in local environment
         imp_object entry = env;
         for (; entry != NULL; entry = imp_rest(entry)) {
@@ -268,8 +267,39 @@ jit_value_t compile(imp_object env, jit_function_t fn, imp_object form, imp_obje
         }
         fprintf(stderr, "unbound: %s\n", form->fields.symbol.name);
         exit(1);
+}
+
+static jit_value_t emit_literal(jit_function_t fn, imp_object env,
+                           imp_object form, imp_object *enclosed) {
+    return jit_value_create_nint_constant (fn, jit_type_nint, (jit_nint)form);
+}
+
+jit_value_t compile(imp_object env, jit_function_t fn, imp_object form, imp_object *enclosed) {
+    if (imp_type_of(form) == CONS) {
+        imp_object f = imp_first(form);
+        if (imp_type_of(f) == SYMBOL) {
+            char *fname = f->fields.symbol.name;
+            if (!strcmp(fname, "+")) {
+                return emit_binop(fn, env, form, enclosed);
+            } else if (!strcmp(fname, "-")) {
+                return emit_binop(fn, env, form, enclosed);
+            } else if (!strcmp(fname, "*")) {
+                return emit_binop(fn, env, form, enclosed);
+            } else if (!strcmp(fname, "/")) {
+                return emit_binop(fn, env, form, enclosed);
+            } else if (!strcmp(fname, "if")) { // (if cond true false)
+                return emit_if(fn, env, form, enclosed);
+            } else if (!strcmp(fname, "let")) { // (let (x 2) ...)
+                return emit_let(fn, env, form, enclosed);
+            } else if (!strcmp(fname, "fn")) { // (fn (x 2) ...)
+                return emit_fn(fn, env, form, enclosed);
+            }
+        }
+        return emit_application(fn, env, form, enclosed);
+    } else if (imp_type_of(form) == SYMBOL) {
+        return emit_resolve(fn, env, form, enclosed);
     } else {
-        return jit_value_create_nint_constant (fn, jit_type_nint, (jit_nint)form);
+        return emit_literal(fn, env, form, enclosed);
     }
 }
 

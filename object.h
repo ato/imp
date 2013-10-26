@@ -57,6 +57,7 @@ void       imp_print(imp_object object);
 imp_object imp_read();
 imp_object imp_lookup(imp_object haystack, imp_object needle);
 imp_object imp_assoc(imp_object m, imp_object k, imp_object v);
+char       *imp_symbol_cstr(imp_object sym);
 
 extern const imp_object TRUE;
 extern const imp_object FALSE;

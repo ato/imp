@@ -20,8 +20,6 @@ const imp_object EMPTY_LIST = NULL;
 static const int MAX_NAME_LEN = 128;
 
 
-
-
 imp_object imp_symbol(const char *name) {
     assert(name);
     char *symbol_name = malloc(strlen(name) + 1);
@@ -30,6 +28,11 @@ imp_object imp_symbol(const char *name) {
     strcpy(symbol_name, name);
     symbol->fields.symbol.name = symbol_name;
     return symbol;
+}
+
+char *imp_symbol_cstr(imp_object sym) {
+    assert(imp_type_of(sym) == SYMBOL);
+    return sym->fields.symbol.name;
 }
 
 imp_object imp_number(int64_t value) {
